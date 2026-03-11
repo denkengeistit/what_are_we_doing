@@ -8,21 +8,14 @@ services:
       - ollama_data:/root/.ollama
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
-  # Pull the default model on first start
-  ollama-pull:
-    image: ollama/ollama:latest
-    depends_on:
-      ollama:
-        condition: service_healthy
-    entrypoint: ["ollama", "pull", "qwen2.5:3b"]
-    environment:
-      - OLLAMA_HOST=http://ollama:11434
-    restart: "no"
+# After first start, pull the model:
+#   docker exec wawd-ollama ollama pull qwen2.5:3b
 
 volumes:
   ollama_data:

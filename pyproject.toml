@@ -5,7 +5,7 @@ description = "Shared versioned workspace with SLM oracle for multi-agent collab
 requires-python = ">=3.11"
 license = "MIT"
 dependencies = [
-    "pyfuse3>=3.3.0",
+    "mfusepy>=0.3.0",
     "mcp>=1.0.0",
     "aiosqlite>=0.20.0",
     "zstandard>=0.22.0",
@@ -25,6 +25,9 @@ dev = [
 
 [project.scripts]
 wawd = "wawd.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["wawd"]
 
 [build-system]
 requires = ["hatchling"]

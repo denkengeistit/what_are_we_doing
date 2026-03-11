@@ -1,0 +1,10 @@
+prefix=/Library/Frameworks/fuse_t.framework
+exec_prefix=${prefix}
+libdir=${prefix}
+includedir=${prefix}/Headers
+
+Name: fuse3
+Description: FUSE-T (userland FUSE for macOS)
+Version: 3.2.0
+Libs: -F/Library/Frameworks -framework fuse_t
+Cflags: -I${includedir} -DFUSE_USE_VERSION=30
