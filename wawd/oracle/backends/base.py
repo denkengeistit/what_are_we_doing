@@ -15,3 +15,7 @@ class OracleBackend(ABC):
     async def health_check(self) -> bool:
         """Return True if the backend is reachable and a model is loaded."""
         ...
+
+    async def close(self) -> None:
+        """Clean up resources. Override if the backend holds connections."""
+        pass

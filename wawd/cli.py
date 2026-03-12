@@ -104,7 +104,7 @@ async def _start_daemon(config: WAWDConfig) -> None:
 
     from wawd.fs.blob_store import BlobStore
     from wawd.fs.version_store import VersionStore
-    from wawd.fs.fuse_mount import mount_fuse, run_fuse_loop
+    from wawd.fs.fuse_mount import mount_fuse, run_fuse_loop, stop_fuse
     from wawd.oracle.backends.ollama import OllamaBackend
     from wawd.oracle.backends.llamacpp import LlamaCppBackend
     from wawd.oracle.context import ContextBuilder
@@ -167,6 +167,7 @@ async def _start_daemon(config: WAWDConfig) -> None:
             config.workspace.exclude,
         )
         oracle.set_fuse(fuse_ops)
+        restorer.set_fuse(fuse_ops)
 
         # Write PID file
         config.pid_path.write_text(str(os.getpid()))
@@ -188,6 +189,8 @@ async def _start_daemon(config: WAWDConfig) -> None:
             task.cancel()
 
     finally:
+        await stop_fuse()
+        await backend.close()
         await db.close()
         config.pid_path.unlink(missing_ok=True)
         console.print("[green]✓[/green] WAWD stopped")

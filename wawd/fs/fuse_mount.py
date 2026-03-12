@@ -1,6 +1,6 @@
 """WAWDFuse: FUSE filesystem that intercepts writes and versions them.
 
-Uses pyfuse3 which is compatible with FUSE-T (userland, no kext on macOS).
+Uses mfusepy (ctypes-based) with FUSE-T on macOS (userland, no kext).
 """
 
 from __future__ import annotations
@@ -10,11 +10,10 @@ import errno
 import fnmatch
 import logging
 import os
-import stat
-import time
+import subprocess
+import sys
+import threading
 from pathlib import Path
-
-import pyfuse3
 
 from wawd.fs.version_store import VersionStore
 
@@ -23,414 +22,404 @@ log = logging.getLogger(__name__)
 # 50 MB max buffer for versioning
 MAX_VERSION_SIZE = 50 * 1024 * 1024
 
+# Module-level state for the active FUSE mount
+_fuse_ops: WAWDFuse | None = None
+_fuse_thread: threading.Thread | None = None
+_fuse_mount_point: str | None = None
 
-class WAWDFuse(pyfuse3.Operations):
-    """FUSE filesystem that transparently versions file writes."""
+
+def _ensure_fuse_library_path() -> None:
+    """Ensure mfusepy can load the FUSE-T framework on macOS."""
+    if sys.platform != "darwin":
+        return
+    if "FUSE_LIBRARY_PATH" in os.environ:
+        return
+    default = "/Library/Frameworks/fuse_t.framework/fuse_t"
+    if Path(default).exists():
+        os.environ["FUSE_LIBRARY_PATH"] = default
+
+
+# Set env var *before* importing mfusepy so ctypes finds the lib.
+_ensure_fuse_library_path()
+
+from mfusepy import FUSE, FuseOSError, Operations  # noqa: E402
+
+
+class WAWDFuse(Operations):
+    """FUSE filesystem that transparently versions file writes.
+
+    All methods are synchronous (called from mfusepy's FUSE thread).
+    Async version-store calls are dispatched via ``_run_async``.
+    """
+
+    # Tell mfusepy to pass timestamps as nanoseconds (avoids deprecation warning).
+    use_ns = True
 
     def __init__(
         self,
         source_dir: str,
         version_store: VersionStore,
+        loop: asyncio.AbstractEventLoop,
         exclude_patterns: list[str] | None = None,
     ) -> None:
-        super().__init__()
         self._source = Path(source_dir).resolve()
         self._vs = version_store
+        self._loop = loop
         self._exclude = exclude_patterns or []
+        self._lock = threading.Lock()
 
-        # Agent/session tracking (set by MCP server)
+        # Agent/session tracking (set by MCP server).
+        # NOTE: these represent the *last known* active agent.  When multiple
+        # agents write concurrently, attribution may be imprecise — the oracle
+        # can refine authorship from session-tracker timing data.
         self.current_agent_id: str = "unknown"
         self.current_session_id: str | None = None
 
-        # Inode management
-        self._inode_to_path: dict[int, Path] = {pyfuse3.ROOT_INODE: self._source}
-        self._path_to_inode: dict[Path, int] = {self._source: pyfuse3.ROOT_INODE}
-        self._next_inode = pyfuse3.ROOT_INODE + 1
+        # Restoration coordination — when True, writes are not versioned.
+        self._paused: bool = False
 
-        # Write buffers keyed by file handle
+        # Write buffers keyed by OS file handle
         self._buffers: dict[int, bytearray] = {}
-        self._fh_to_path: dict[int, Path] = {}
-        self._fh_flags: dict[int, int] = {}
-        self._next_fh = 1
+        self._fh_to_path: dict[int, str] = {}
 
-    def _get_inode(self, path: Path) -> int:
-        """Get or assign an inode for a path."""
-        path = path.resolve()
-        if path in self._path_to_inode:
-            return self._path_to_inode[path]
-        inode = self._next_inode
-        self._next_inode += 1
-        self._inode_to_path[inode] = path
-        self._path_to_inode[path] = inode
-        return inode
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
-    def _inode_path(self, inode: int) -> Path:
-        """Resolve an inode to its filesystem path."""
+    def _full_path(self, path: str) -> str:
+        """Resolve a FUSE relative path to an absolute source path."""
+        if path.lstrip("/") == ".wawd" or path.lstrip("/").startswith(".wawd/"):
+            raise FuseOSError(errno.ENOENT)
+        return str(self._source / path.lstrip("/"))
+
+    def _relative_path(self, full_path: str) -> str:
+        """Convert an absolute path back to source-relative."""
         try:
-            return self._inode_to_path[inode]
-        except KeyError:
-            raise pyfuse3.FUSEError(errno.ENOENT)
-
-    def _relative_path(self, path: Path) -> str:
-        """Get path relative to source directory."""
-        try:
-            return str(path.resolve().relative_to(self._source))
+            return str(Path(full_path).resolve().relative_to(self._source))
         except ValueError:
-            return str(path)
+            return full_path
 
     def _is_excluded(self, rel_path: str) -> bool:
-        """Check if a path matches any exclude pattern."""
+        """Check whether *rel_path* matches any exclude pattern."""
         for pattern in self._exclude:
-            if fnmatch.fnmatch(rel_path, pattern) or fnmatch.fnmatch(
-                rel_path + "/", pattern
-            ):
+            if fnmatch.fnmatch(rel_path, pattern) or fnmatch.fnmatch(rel_path + "/", pattern):
                 return True
-            # Check each path component
             for part in Path(rel_path).parts:
-                if fnmatch.fnmatch(part, pattern) or fnmatch.fnmatch(
-                    part + "/", pattern
-                ):
+                if fnmatch.fnmatch(part, pattern) or fnmatch.fnmatch(part + "/", pattern):
                     return True
         return False
 
-    def _make_attr(self, path: Path, inode: int) -> pyfuse3.EntryAttributes:
-        """Build entry attributes from an on-disk path."""
+    def _run_async(self, coro):
+        """Run an async coroutine on the main event loop from the FUSE thread."""
+        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return fut.result(timeout=30)
+
+    # ------------------------------------------------------------------
+    # Restoration coordination
+    # ------------------------------------------------------------------
+
+    def pause(self) -> None:
+        """Suppress versioning. Called before the restorer writes to disk."""
+        with self._lock:
+            self._paused = True
+
+    def resume(self) -> None:
+        """Re-enable versioning after restoration completes."""
+        with self._lock:
+            self._paused = False
+
+    def invalidate(self, paths: list[str]) -> None:
+        """Drop write buffers for *paths* after external (restorer) writes.
+
+        Any file handle whose tracked path matches one of the given
+        source-relative paths loses its buffer so a subsequent
+        ``release()`` won't overwrite the restored content.
+        """
+        with self._lock:
+            fhs_to_drop = [
+                fh for fh, full in self._fh_to_path.items()
+                if self._relative_path(full) in paths
+            ]
+            for fh in fhs_to_drop:
+                self._buffers.pop(fh, None)
+
+    # ------------------------------------------------------------------
+    # Filesystem metadata
+    # ------------------------------------------------------------------
+
+    def access(self, path: str, mode: int) -> None:
+        if not os.access(self._full_path(path), mode):
+            raise FuseOSError(errno.EACCES)
+
+    def chmod(self, path: str, mode: int) -> None:
+        os.chmod(self._full_path(path), mode)
+
+    def chown(self, path: str, uid: int, gid: int) -> None:
+        os.chown(self._full_path(path), uid, gid)
+
+    def getattr(self, path: str, fh: int | None = None) -> dict:
+        full = self._full_path(path)
         try:
-            st = os.lstat(str(path))
+            st = os.lstat(full)
         except FileNotFoundError:
-            raise pyfuse3.FUSEError(errno.ENOENT)
+            raise FuseOSError(errno.ENOENT)
+        return {
+            "st_atime": st.st_atime,
+            "st_ctime": st.st_ctime,
+            "st_gid": st.st_gid,
+            "st_mode": st.st_mode,
+            "st_mtime": st.st_mtime,
+            "st_nlink": st.st_nlink,
+            "st_size": st.st_size,
+            "st_uid": st.st_uid,
+        }
 
-        attr = pyfuse3.EntryAttributes()
-        attr.st_ino = inode
-        attr.st_mode = st.st_mode
-        attr.st_nlink = st.st_nlink
-        attr.st_uid = st.st_uid
-        attr.st_gid = st.st_gid
-        attr.st_size = st.st_size
-        attr.st_atime_ns = st.st_atime_ns
-        attr.st_mtime_ns = st.st_mtime_ns
-        attr.st_ctime_ns = st.st_ctime_ns
-        attr.st_blksize = getattr(st, "st_blksize", 512)
-        attr.st_blocks = getattr(st, "st_blocks", 0)
-        attr.generation = 0
-        attr.entry_timeout = 1
-        attr.attr_timeout = 1
-        return attr
+    def readdir(self, path: str, fh: int) -> list[str]:
+        full = self._full_path(path)
+        entries = [".", ".."]
+        try:
+            for name in os.listdir(full):
+                if name == ".wawd":
+                    continue
+                entries.append(name)
+        except OSError:
+            pass
+        return entries
 
-    # --- FUSE Operations ---
+    def readlink(self, path: str) -> str:
+        target = os.readlink(self._full_path(path))
+        if target.startswith("/"):
+            return os.path.relpath(target, str(self._source))
+        return target
 
-    async def getattr(self, inode: int, ctx=None) -> pyfuse3.EntryAttributes:
-        path = self._inode_path(inode)
-        return self._make_attr(path, inode)
+    def statfs(self, path: str) -> dict:
+        stv = os.statvfs(self._full_path(path))
+        return {
+            "f_bavail": stv.f_bavail,
+            "f_bfree": stv.f_bfree,
+            "f_blocks": stv.f_blocks,
+            "f_bsize": stv.f_bsize,
+            "f_favail": stv.f_favail,
+            "f_ffree": stv.f_ffree,
+            "f_files": stv.f_files,
+            "f_flag": stv.f_flag,
+            "f_frsize": stv.f_frsize,
+            "f_namemax": stv.f_namemax,
+        }
 
-    async def lookup(self, parent_inode: int, name: bytes, ctx=None) -> pyfuse3.EntryAttributes:
-        name_str = name.decode()
-        # Block /.wawd/ for now (Phase 3)
-        if name_str == ".wawd":
-            raise pyfuse3.FUSEError(errno.ENOENT)
+    def utimens(self, path: str, times: tuple | None = None) -> None:
+        os.utime(self._full_path(path), times)
 
-        parent_path = self._inode_path(parent_inode)
-        child_path = parent_path / name_str
+    # ------------------------------------------------------------------
+    # Directory operations
+    # ------------------------------------------------------------------
 
-        if not child_path.exists():
-            raise pyfuse3.FUSEError(errno.ENOENT)
+    def mkdir(self, path: str, mode: int) -> None:
+        os.mkdir(self._full_path(path), mode)
 
-        inode = self._get_inode(child_path)
-        return self._make_attr(child_path, inode)
+    def rmdir(self, path: str) -> None:
+        os.rmdir(self._full_path(path))
 
-    async def opendir(self, inode: int, ctx=None) -> int:
-        self._inode_path(inode)  # Validate
-        fh = self._next_fh
-        self._next_fh += 1
-        self._fh_to_path[fh] = self._inode_path(inode)
+    def mknod(self, path: str, mode: int, dev: int) -> None:
+        os.mknod(self._full_path(path), mode, dev)
+
+    def symlink(self, target: str, name: str) -> None:
+        os.symlink(target, self._full_path(name))
+
+    def link(self, target: str, name: str) -> None:
+        os.link(self._full_path(target), self._full_path(name))
+
+    # ------------------------------------------------------------------
+    # File operations
+    # ------------------------------------------------------------------
+
+    def open(self, path: str, flags: int) -> int:
+        full = self._full_path(path)
+        fh = os.open(full, flags)
+
+        with self._lock:
+            self._fh_to_path[fh] = full
+
+            if flags & (os.O_WRONLY | os.O_RDWR):
+                try:
+                    with open(full, "rb") as f:
+                        content = f.read()
+                except OSError:
+                    content = b""
+                if len(content) <= MAX_VERSION_SIZE:
+                    self._buffers[fh] = bytearray(content)
+                if flags & os.O_TRUNC:
+                    self._buffers[fh] = bytearray()
+
         return fh
 
-    async def readdir(self, fh: int, start_id: int, token) -> None:
-        path = self._fh_to_path[fh]
-        entries = []
-        try:
-            for i, entry in enumerate(sorted(os.scandir(str(path)), key=lambda e: e.name)):
-                if entry.name == ".wawd":
-                    continue
-                child_path = Path(entry.path)
-                inode = self._get_inode(child_path)
-                entries.append((inode, entry.name, child_path))
-        except OSError:
-            return
+    def create(self, path: str, mode: int, fi=None) -> int:
+        full = self._full_path(path)
+        fh = os.open(full, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        with self._lock:
+            self._fh_to_path[fh] = full
+            self._buffers[fh] = bytearray()
+        return fh
 
-        for i, (inode, name, child_path) in enumerate(entries):
-            if i < start_id:
-                continue
-            attr = self._make_attr(child_path, inode)
-            if not pyfuse3.readdir_reply(token, name.encode(), attr, i + 1):
-                break
+    def read(self, path: str, length: int, offset: int, fh: int) -> bytes:
+        os.lseek(fh, offset, os.SEEK_SET)
+        return os.read(fh, length)
 
-    async def releasedir(self, fh: int) -> None:
-        self._fh_to_path.pop(fh, None)
+    def write(self, path: str, buf: bytes, offset: int, fh: int) -> int:
+        os.lseek(fh, offset, os.SEEK_SET)
+        written = os.write(fh, buf)
 
-    async def open(self, inode: int, flags: int, ctx=None) -> pyfuse3.FileInfo:
-        path = self._inode_path(inode)
-        fh = self._next_fh
-        self._next_fh += 1
-        self._fh_to_path[fh] = path
-        self._fh_flags[fh] = flags
+        with self._lock:
+            if fh in self._buffers:
+                b = self._buffers[fh]
+                end = offset + len(buf)
+                if end > len(b):
+                    b.extend(b"\x00" * (end - len(b)))
+                b[offset:end] = buf
 
-        # If opened for writing, initialize buffer with current content
-        if flags & (os.O_WRONLY | os.O_RDWR):
-            try:
-                if path.is_file():
-                    content = path.read_bytes()
-                    if len(content) <= MAX_VERSION_SIZE:
-                        self._buffers[fh] = bytearray(content)
-                    # Large files: skip versioning
-                else:
-                    self._buffers[fh] = bytearray()
-            except OSError:
-                self._buffers[fh] = bytearray()
+        return written
 
-            if flags & os.O_TRUNC and fh in self._buffers:
-                self._buffers[fh] = bytearray()
+    def truncate(self, path: str, length: int, fh: int | None = None) -> None:
+        full = self._full_path(path)
+        with open(full, "r+b") as f:
+            f.truncate(length)
+        with self._lock:
+            if fh is not None and fh in self._buffers:
+                self._buffers[fh] = bytearray(self._buffers[fh][:length])
+            else:
+                # FUSE-T (NFS-based) sends truncate without an fh after open.
+                # Find all open buffers for this path and truncate them.
+                for tracked_fh, tracked_path in self._fh_to_path.items():
+                    if tracked_path == full and tracked_fh in self._buffers:
+                        self._buffers[tracked_fh] = bytearray(
+                            self._buffers[tracked_fh][:length]
+                        )
 
-        fi = pyfuse3.FileInfo()
-        fi.fh = fh
-        fi.keep_cache = False
-        return fi
+    def flush(self, path: str, fh: int) -> None:
+        os.fsync(fh)
 
-    async def create(
-        self, parent_inode: int, name: bytes, mode: int, flags: int, ctx=None
-    ) -> tuple[pyfuse3.FileInfo, pyfuse3.EntryAttributes]:
-        parent_path = self._inode_path(parent_inode)
-        child_path = parent_path / name.decode()
+    def release(self, path: str, fh: int) -> None:
+        """File handle closed — version the content if it was buffered."""
+        with self._lock:
+            full = self._fh_to_path.pop(fh, None)
+            buffer = self._buffers.pop(fh, None)
+            paused = self._paused
+        os.close(fh)
 
-        # Create the file on disk
-        fd = os.open(str(child_path), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, mode)
-        os.close(fd)
-
-        inode = self._get_inode(child_path)
-        fh = self._next_fh
-        self._next_fh += 1
-        self._fh_to_path[fh] = child_path
-        self._fh_flags[fh] = flags
-        self._buffers[fh] = bytearray()
-
-        fi = pyfuse3.FileInfo()
-        fi.fh = fh
-        fi.keep_cache = False
-
-        attr = self._make_attr(child_path, inode)
-        return (fi, attr)
-
-    async def read(self, fh: int, offset: int, size: int) -> bytes:
-        # If we have a write buffer, read from it
-        if fh in self._buffers:
-            buf = self._buffers[fh]
-            return bytes(buf[offset : offset + size])
-
-        path = self._fh_to_path.get(fh)
-        if path is None:
-            raise pyfuse3.FUSEError(errno.EBADF)
-
-        try:
-            with open(str(path), "rb") as f:
-                f.seek(offset)
-                return f.read(size)
-        except OSError as e:
-            raise pyfuse3.FUSEError(e.errno or errno.EIO)
-
-    async def write(self, fh: int, offset: int, buf: bytes) -> int:
-        if fh not in self._buffers:
-            # Large file or non-buffered: write through
-            path = self._fh_to_path.get(fh)
-            if path is None:
-                raise pyfuse3.FUSEError(errno.EBADF)
-            with open(str(path), "r+b") as f:
-                f.seek(offset)
-                return f.write(buf)
-
-        buffer = self._buffers[fh]
-        end = offset + len(buf)
-        if end > len(buffer):
-            buffer.extend(b"\x00" * (end - len(buffer)))
-        buffer[offset:end] = buf
-        return len(buf)
-
-    async def release(self, fh: int) -> None:
-        """Called when a file handle is closed. Version if content changed."""
-        path = self._fh_to_path.pop(fh, None)
-        self._fh_flags.pop(fh, None)
-        buffer = self._buffers.pop(fh, None)
-
-        if path is None or buffer is None:
+        if full is None or buffer is None or paused:
             return
 
         content = bytes(buffer)
-        rel_path = self._relative_path(path)
+        rel = self._relative_path(full)
 
-        # Write content to disk
-        try:
-            path.write_bytes(content)
-        except OSError:
-            log.exception("Failed to write %s to disk", rel_path)
+        if self._is_excluded(rel) or len(content) > MAX_VERSION_SIZE:
             return
 
-        # Skip versioning for excluded paths or oversized files
-        if self._is_excluded(rel_path) or len(content) > MAX_VERSION_SIZE:
-            return
-
-        # Record version (async — run in the event loop)
         try:
-            version_id = await self._vs.record_version(
-                path=rel_path,
-                content=content,
-                agent_id=self.current_agent_id,
-                session_id=self.current_session_id,
-            )
-            if version_id is not None:
-                log.debug("Versioned %s -> v%d", rel_path, version_id)
-        except Exception:
-            log.exception("Failed to version %s", rel_path)
-
-    async def unlink(self, parent_inode: int, name: bytes, ctx=None) -> None:
-        parent_path = self._inode_path(parent_inode)
-        child_path = parent_path / name.decode()
-        rel_path = self._relative_path(child_path)
-
-        os.unlink(str(child_path))
-
-        # Remove from inode maps
-        child_path_resolved = child_path.resolve()
-        inode = self._path_to_inode.pop(child_path_resolved, None)
-        if inode is not None:
-            self._inode_to_path.pop(inode, None)
-
-        # Record delete
-        if not self._is_excluded(rel_path):
-            try:
-                await self._vs.record_delete(
-                    path=rel_path,
-                    agent_id=self.current_agent_id,
-                    session_id=self.current_session_id,
-                )
-            except Exception:
-                log.exception("Failed to record delete for %s", rel_path)
-
-    async def rename(
-        self,
-        parent_inode_old: int,
-        name_old: bytes,
-        parent_inode_new: int,
-        name_new: bytes,
-        flags: int,
-        ctx=None,
-    ) -> None:
-        old_parent = self._inode_path(parent_inode_old)
-        new_parent = self._inode_path(parent_inode_new)
-        old_path = old_parent / name_old.decode()
-        new_path = new_parent / name_new.decode()
-
-        # Read content before rename for versioning
-        content = None
-        if old_path.is_file():
-            try:
-                content = old_path.read_bytes()
-            except OSError:
-                pass
-
-        os.rename(str(old_path), str(new_path))
-
-        # Update inode maps
-        old_resolved = old_path.resolve()
-        inode = self._path_to_inode.pop(old_resolved, None)
-        new_resolved = new_path.resolve()
-        if inode is not None:
-            self._inode_to_path[inode] = new_resolved
-            self._path_to_inode[new_resolved] = inode
-
-        old_rel = self._relative_path(old_path)
-        new_rel = self._relative_path(new_path)
-
-        if not self._is_excluded(old_rel):
-            try:
-                await self._vs.record_delete(
-                    path=old_rel,
-                    agent_id=self.current_agent_id,
-                    session_id=self.current_session_id,
-                    intent=f"Renamed to {new_rel}",
-                )
-            except Exception:
-                log.exception("Failed to record delete for rename %s", old_rel)
-
-        if content is not None and not self._is_excluded(new_rel) and len(content) <= MAX_VERSION_SIZE:
-            try:
-                await self._vs.record_version(
-                    path=new_rel,
+            version_id = self._run_async(
+                self._vs.record_version(
+                    path=rel,
                     content=content,
                     agent_id=self.current_agent_id,
                     session_id=self.current_session_id,
-                    intent=f"Renamed from {old_rel}",
+                )
+            )
+            if version_id is not None:
+                log.debug("Versioned %s -> v%d", rel, version_id)
+        except Exception:
+            log.exception("Failed to version %s", rel)
+
+    def fsync(self, path: str, fdatasync: bool, fh: int) -> None:
+        self.flush(path, fh)
+
+    # ------------------------------------------------------------------
+    # Versioned destructive operations
+    # ------------------------------------------------------------------
+
+    def unlink(self, path: str) -> None:
+        full = self._full_path(path)
+        rel = self._relative_path(full)
+        os.unlink(full)
+
+        if self._paused or self._is_excluded(rel):
+            return
+
+        try:
+            self._run_async(
+                self._vs.record_delete(
+                    path=rel,
+                    agent_id=self.current_agent_id,
+                    session_id=self.current_session_id,
+                )
+            )
+        except Exception:
+            log.exception("Failed to record delete for %s", rel)
+
+    def rename(self, old: str, new: str) -> None:
+        old_full = self._full_path(old)
+        new_full = self._full_path(new)
+        # Resolve relative paths BEFORE the rename so old_full still exists.
+        old_rel = self._relative_path(old_full)
+        new_rel = self._relative_path(new_full)
+
+        content = None
+        if os.path.isfile(old_full):
+            try:
+                with open(old_full, "rb") as f:
+                    content = f.read()
+            except OSError:
+                pass
+
+        os.rename(old_full, new_full)
+
+        if self._paused:
+            return
+
+        if not self._is_excluded(old_rel):
+            try:
+                self._run_async(
+                    self._vs.record_delete(
+                        path=old_rel,
+                        agent_id=self.current_agent_id,
+                        session_id=self.current_session_id,
+                        intent=f"Renamed to {new_rel}",
+                    )
                 )
             except Exception:
-                log.exception("Failed to record create for rename %s", new_rel)
+                log.exception("Failed to record delete during rename for %s", old_rel)
 
-    async def mkdir(self, parent_inode: int, name: bytes, mode: int, ctx=None) -> pyfuse3.EntryAttributes:
-        parent_path = self._inode_path(parent_inode)
-        child_path = parent_path / name.decode()
-        os.mkdir(str(child_path), mode)
-        inode = self._get_inode(child_path)
-        return self._make_attr(child_path, inode)
+        if content is not None and len(content) <= MAX_VERSION_SIZE and not self._is_excluded(new_rel):
+            try:
+                self._run_async(
+                    self._vs.record_version(
+                        path=new_rel,
+                        content=content,
+                        agent_id=self.current_agent_id,
+                        session_id=self.current_session_id,
+                        intent=f"Renamed from {old_rel}",
+                    )
+                )
+            except Exception:
+                log.exception("Failed to record create during rename for %s", new_rel)
 
-    async def rmdir(self, parent_inode: int, name: bytes, ctx=None) -> None:
-        parent_path = self._inode_path(parent_inode)
-        child_path = parent_path / name.decode()
-        os.rmdir(str(child_path))
 
-        child_resolved = child_path.resolve()
-        inode = self._path_to_inode.pop(child_resolved, None)
-        if inode is not None:
-            self._inode_to_path.pop(inode, None)
+# ======================================================================
+# Public helpers — called from cli.py
+# ======================================================================
 
-    async def setattr(self, inode: int, attr, fields, fh=None, ctx=None) -> pyfuse3.EntryAttributes:
-        path = self._inode_path(inode)
-
-        if fields.update_size:
-            with open(str(path), "r+b") as f:
-                f.truncate(attr.st_size)
-            # Also truncate buffer if present
-            if fh is not None and fh in self._buffers:
-                self._buffers[fh] = bytearray(self._buffers[fh][: attr.st_size])
-
-        if fields.update_mode:
-            os.chmod(str(path), stat.S_IMODE(attr.st_mode))
-
-        if fields.update_uid or fields.update_gid:
-            uid = attr.st_uid if fields.update_uid else -1
-            gid = attr.st_gid if fields.update_gid else -1
-            os.chown(str(path), uid, gid)
-
-        if fields.update_atime or fields.update_mtime:
-            atime_ns = attr.st_atime_ns if fields.update_atime else None
-            mtime_ns = attr.st_mtime_ns if fields.update_mtime else None
-            if atime_ns is not None or mtime_ns is not None:
-                st = os.lstat(str(path))
-                a = atime_ns if atime_ns is not None else st.st_atime_ns
-                m = mtime_ns if mtime_ns is not None else st.st_mtime_ns
-                os.utime(str(path), ns=(a, m))
-
-        return self._make_attr(path, inode)
-
-    async def statfs(self, ctx=None) -> pyfuse3.StatvfsData:
-        st = os.statvfs(str(self._source))
-        out = pyfuse3.StatvfsData()
-        out.f_bsize = st.f_bsize
-        out.f_frsize = st.f_frsize
-        out.f_blocks = st.f_blocks
-        out.f_bfree = st.f_bfree
-        out.f_bavail = st.f_bavail
-        out.f_files = st.f_files
-        out.f_ffree = st.f_ffree
-        out.f_favail = st.f_favail
-        out.f_namemax = st.f_namemax
-        return out
+def _fuse_thread_main(ops: WAWDFuse, mount_point: str) -> None:
+    """Target for the daemon thread that runs the blocking FUSE main loop."""
+    try:
+        FUSE(
+            ops,
+            mount_point,
+            foreground=True,
+            nothreads=False,
+            fsname="wawd",
+            allow_other=False,
+        )
+    except Exception:
+        log.exception("FUSE thread crashed")
 
 
 async def mount_fuse(
@@ -439,26 +428,44 @@ async def mount_fuse(
     version_store: VersionStore,
     exclude_patterns: list[str] | None = None,
 ) -> WAWDFuse:
-    """Initialize and mount the FUSE filesystem. Returns the operations instance."""
-    mount_path = Path(mount_point)
-    mount_path.mkdir(parents=True, exist_ok=True)
+    """Initialize and mount the FUSE filesystem. Returns the ops instance."""
+    global _fuse_ops, _fuse_thread, _fuse_mount_point
 
-    ops = WAWDFuse(source_dir, version_store, exclude_patterns)
+    Path(mount_point).mkdir(parents=True, exist_ok=True)
 
-    fuse_options = set(pyfuse3.default_options)
-    fuse_options.add("fsname=wawd")
-    fuse_options.discard("default_permissions")
+    loop = asyncio.get_running_loop()
+    ops = WAWDFuse(source_dir, version_store, loop, exclude_patterns)
 
-    pyfuse3.init(ops, str(mount_path), fuse_options)
-    log.info("FUSE mounted: %s -> %s", source_dir, mount_point)
+    t = threading.Thread(
+        target=_fuse_thread_main,
+        args=(ops, mount_point),
+        daemon=True,
+        name="wawd-fuse",
+    )
+    t.start()
+
+    _fuse_ops = ops
+    _fuse_thread = t
+    _fuse_mount_point = mount_point
+
+    # Give FUSE a moment to initialise.
+    await asyncio.sleep(0.5)
+    log.info("FUSE thread started: %s -> %s", source_dir, mount_point)
     return ops
 
 
 async def run_fuse_loop() -> None:
-    """Run the FUSE event loop (blocking)."""
-    try:
-        await pyfuse3.main()
-    except Exception:
-        log.exception("FUSE event loop error")
-    finally:
-        pyfuse3.close(unmount=True)
+    """Keep-alive coroutine that watches the FUSE daemon thread."""
+    while True:
+        await asyncio.sleep(0.5)
+        if _fuse_thread is not None and not _fuse_thread.is_alive():
+            raise RuntimeError("FUSE thread exited unexpectedly")
+
+
+async def stop_fuse() -> None:
+    """Unmount the FUSE filesystem (best-effort)."""
+    global _fuse_mount_point
+    if not _fuse_mount_point:
+        return
+    subprocess.run(["umount", _fuse_mount_point], capture_output=True, text=True)
+    await asyncio.sleep(0.2)

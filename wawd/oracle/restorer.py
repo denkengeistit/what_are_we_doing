@@ -59,6 +59,11 @@ class Restorer:
         self._ctx = context_builder
         self._backend = backend
         self._workspace = Path(workspace_path)
+        self._fuse = None  # WAWDFuse ops, set after mount via set_fuse()
+
+    def set_fuse(self, fuse_ops) -> None:
+        """Attach the FUSE ops instance for pause/resume during restoration."""
+        self._fuse = fuse_ops
 
     async def analyze_and_restore(
         self,
@@ -76,6 +81,12 @@ class Restorer:
         # Parse oracle response
         plan = self._parse_oracle_response(response)
 
+        # If the oracle failed to produce a usable plan, fall back to
+        # restoring changed files to their state from 1 hour ago.
+        if not plan.files and plan.confidence == "low":
+            log.warning("Oracle produced no restoration plan; falling back to time-based restore")
+            plan = await self._build_fallback_plan(scope, plan.auto_snapshot_name)
+
         if dry_run:
             return RestorationResult(
                 action_taken="dry_run",
@@ -90,7 +101,12 @@ class Restorer:
         return await self.execute_restoration_plan(plan)
 
     async def execute_restoration_plan(self, plan: RestorationPlan) -> RestorationResult:
-        """Execute a restoration plan: snapshot, restore, update disk."""
+        """Execute a restoration plan: snapshot, restore, update disk.
+
+        The FUSE layer is paused during restoration so that disk writes
+        are not re-versioned, and any stale write buffers are invalidated
+        afterwards.
+        """
         if not plan.files:
             return RestorationResult(
                 action_taken="no_action",
@@ -103,37 +119,46 @@ class Restorer:
         try:
             await self._vs.create_snapshot(
                 name=plan.auto_snapshot_name,
-                description=f"Auto-snapshot before restoration",
+                description="Auto-snapshot before restoration",
                 created_by="oracle",
             )
         except Exception as e:
             log.warning("Failed to create pre-restore snapshot: %s", e)
 
+        # Pause FUSE so restoration writes aren't re-versioned
+        if self._fuse:
+            self._fuse.pause()
+
         # Execute restorations
         restored = []
-        for fr in plan.files:
-            try:
-                await self._vs.restore_file_to_version(fr.path, fr.to_version_id)
+        try:
+            for fr in plan.files:
+                try:
+                    await self._vs.restore_file_to_version(fr.path, fr.to_version_id)
 
-                # Update on-disk file
-                content = await self._vs.get_content(fr.to_version_id)
-                disk_path = self._workspace / fr.path
-                disk_path.parent.mkdir(parents=True, exist_ok=True)
-                disk_path.write_bytes(content)
+                    # Update on-disk file
+                    content = await self._vs.get_content(fr.to_version_id)
+                    disk_path = self._workspace / fr.path
+                    disk_path.parent.mkdir(parents=True, exist_ok=True)
+                    disk_path.write_bytes(content)
 
-                restored.append({
-                    "path": fr.path,
-                    "to_version": fr.to_version_id,
-                    "reason": fr.reason,
-                })
-                log.info("Restored %s to version %d", fr.path, fr.to_version_id)
-            except Exception as e:
-                log.error("Failed to restore %s: %s", fr.path, e)
-                restored.append({
-                    "path": fr.path,
-                    "to_version": fr.to_version_id,
-                    "error": str(e),
-                })
+                    restored.append({
+                        "path": fr.path,
+                        "to_version": fr.to_version_id,
+                        "reason": fr.reason,
+                    })
+                    log.info("Restored %s to version %d", fr.path, fr.to_version_id)
+                except Exception as e:
+                    log.error("Failed to restore %s: %s", fr.path, e)
+                    restored.append({
+                        "path": fr.path,
+                        "to_version": fr.to_version_id,
+                        "error": str(e),
+                    })
+        finally:
+            if self._fuse:
+                self._fuse.invalidate([fr.path for fr in plan.files])
+                self._fuse.resume()
 
         return RestorationResult(
             action_taken="restored",
@@ -173,10 +198,52 @@ class Restorer:
         except (json.JSONDecodeError, KeyError, TypeError) as e:
             log.warning("Failed to parse oracle response as JSON: %s", e)
             log.warning("Oracle response was: %s", response[:500])
-            # Fallback: empty plan (caller can decide to restore from snapshot)
+            # Return empty low-confidence plan; analyze_and_restore() will
+            # invoke _build_fallback_plan() when it sees this.
             return RestorationPlan(
                 files=[],
                 explanation=f"Oracle response was unparseable. Original response: {response[:200]}",
                 auto_snapshot_name=snapshot_name,
                 confidence="low",
             )
+
+    async def _build_fallback_plan(
+        self, scope: str | None, snapshot_name: str,
+    ) -> RestorationPlan:
+        """Build a fallback plan: restore changed files to their state 1 hour ago."""
+        target_time = time.time() - 3600
+
+        changes = await self._vs.get_changes_since(target_time)
+        if scope:
+            changes = [c for c in changes if c.path.startswith(scope)]
+
+        files: list[FileRestoration] = []
+        seen: set[str] = set()
+        for change in changes:
+            if change.path in seen:
+                continue
+            seen.add(change.path)
+
+            history = await self._vs.get_history(change.path, limit=50)
+            for entry in history:
+                if entry.timestamp <= target_time and entry.blob_hash:
+                    files.append(FileRestoration(
+                        path=change.path,
+                        to_version_id=entry.id,
+                        reason="Fallback: oracle response unparseable, restoring to pre-change state",
+                    ))
+                    break
+
+        explanation = (
+            "Oracle could not produce a valid restoration plan. "
+            "Falling back to restoring changed files to their state from 1 hour ago."
+        )
+        if not files:
+            explanation += " No eligible files found in the target window."
+
+        return RestorationPlan(
+            files=files,
+            explanation=explanation,
+            auto_snapshot_name=snapshot_name,
+            confidence="low",
+        )
