@@ -81,7 +81,9 @@ class VersionStore:
         self._blobs = blob_store
 
     async def init_db(self) -> None:
-        """Create tables and indices."""
+        """Create tables and indices, enable WAL mode."""
+        await self._db.execute("PRAGMA journal_mode=WAL")
+        await self._db.execute("PRAGMA synchronous=NORMAL")
         await self._db.executescript(SCHEMA)
 
     async def record_version(
@@ -115,6 +117,10 @@ class VersionStore:
         await self._db.commit()
         version_id = cursor.lastrowid
         log.debug("Recorded %s v%d for %s (%s)", operation, version_id, path, blob_hash[:12])
+        
+        # Prune to keep only the 3 most recent versions for this path
+        await self._prune_old_versions(path)
+        
         return version_id
 
     async def record_delete(
@@ -136,6 +142,10 @@ class VersionStore:
         )
         await self._db.commit()
         log.debug("Recorded delete v%d for %s", cursor.lastrowid, path)
+        
+        # Prune old versions for this path
+        await self._prune_old_versions(path)
+        
         return cursor.lastrowid
 
     async def get_latest(self, path: str) -> VersionEntry | None:
@@ -334,3 +344,36 @@ class VersionStore:
         )
         rows = await cursor.fetchall()
         return [VersionEntry.from_row(r) for r in rows]
+    
+    async def _prune_old_versions(self, path: str) -> None:
+        """Keep only the 3 most recent versions for a given path."""
+        # Get all version IDs for this path, newest first
+        cursor = await self._db.execute(
+            "SELECT id, blob_hash FROM versions WHERE path = ? ORDER BY timestamp DESC",
+            (path,),
+        )
+        rows = await cursor.fetchall()
+        
+        if len(rows) <= 3:
+            return
+        
+        # Delete versions beyond the 3 most recent
+        to_delete = rows[3:]
+        orphaned_hashes = [r[1] for r in to_delete if r[1] is not None]
+        
+        for row in to_delete:
+            await self._db.execute("DELETE FROM versions WHERE id = ?", (row[0],))
+        
+        # Clean up orphaned blobs
+        for blob_hash in orphaned_hashes:
+            # Check if any other version still references this blob
+            cursor = await self._db.execute(
+                "SELECT COUNT(*) FROM versions WHERE blob_hash = ?",
+                (blob_hash,),
+            )
+            count = (await cursor.fetchone())[0]
+            if count == 0:
+                await self._blobs.delete(blob_hash)
+        
+        await self._db.commit()
+        log.debug("Pruned %d old versions for %s", len(to_delete), path)

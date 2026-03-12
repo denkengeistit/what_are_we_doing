@@ -156,7 +156,7 @@ async def _start_daemon(config: WAWDConfig) -> None:
         # Initialize oracle components
         context_builder = ContextBuilder(
             version_store, session_tracker,
-            config.oracle.context_budget_tokens, config.oracle.history_depth,
+            config.oracle.history_depth,
         )
         restorer = Restorer(version_store, context_builder, backend, config.workspace.path)
         oracle = Oracle(
@@ -345,7 +345,7 @@ async def _ask(config: WAWDConfig, question: str) -> None:
 
         context_builder = ContextBuilder(
             version_store, session_tracker,
-            config.oracle.context_budget_tokens, config.oracle.history_depth,
+            config.oracle.history_depth,
         )
         restorer = Restorer(version_store, context_builder, backend, config.workspace.path)
         oracle = Oracle(

@@ -15,19 +15,6 @@ log = logging.getLogger(__name__)
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
 
-def _token_estimate(text: str) -> int:
-    """Rough token count: ~4 chars per token."""
-    return len(text) // 4
-
-
-def _truncate_to_budget(text: str, budget_tokens: int) -> str:
-    """Truncate text to fit within a token budget."""
-    max_chars = budget_tokens * 4
-    if len(text) <= max_chars:
-        return text
-    return text[:max_chars] + "\n... [truncated]"
-
-
 def _load_prompt(name: str) -> str:
     """Load a system prompt from the prompts directory."""
     path = PROMPTS_DIR / name
@@ -44,12 +31,10 @@ class ContextBuilder:
         self,
         version_store: VersionStore,
         session_tracker: SessionTracker,
-        context_budget_tokens: int = 32000,
         history_depth: int = 50,
     ) -> None:
         self._vs = version_store
         self._st = session_tracker
-        self._budget = context_budget_tokens
         self._depth = history_depth
 
     async def build_briefing_context(
@@ -92,7 +77,6 @@ class ContextBuilder:
                 diff_sections.append(diff_text)
 
             diff_content = "\n\n".join(diff_sections)
-            diff_content = _truncate_to_budget(diff_content, 5000)
             messages.append({
                 "role": "system",
                 "content": f"Recent changes (detailed):\n{diff_content}",
@@ -108,7 +92,6 @@ class ContextBuilder:
                         f" by {entry.agent_id or 'unknown'}"
                     )
                 summary_content = "\n".join(summary_lines)
-                summary_content = _truncate_to_budget(summary_content, 1200)
                 messages.append({
                     "role": "system",
                     "content": f"Older changes (summary):\n{summary_content}",
@@ -180,7 +163,6 @@ class ContextBuilder:
                     )
 
             history_content = "\n\n".join(diff_sections)
-            history_content = _truncate_to_budget(history_content, self._budget - 2000)
             messages.append({
                 "role": "system",
                 "content": f"Version history:\n{history_content}",
@@ -226,7 +208,6 @@ class ContextBuilder:
                 diff_sections.append(diff_text)
 
             history_content = "\n\n".join(diff_sections)
-            history_content = _truncate_to_budget(history_content, self._budget - 2000)
             messages.append({
                 "role": "system",
                 "content": f"Complete version history for scope:\n{history_content}",

@@ -36,7 +36,6 @@ class WorkspaceConfig(BaseModel):
 class VersioningConfig(BaseModel):
     """Versioning behavior knobs."""
 
-    max_versions_per_file: int = 500
     skip_binary_over_mb: int = 10
     compression_level: int = 3
 
@@ -49,7 +48,6 @@ class OracleConfig(BaseModel):
     base_url: str = "http://localhost:11434"
     api_key: str = ""  # For openai_compat; overridden by WAWD_OPENAI_API_KEY env var
     timeout_seconds: float = 300.0
-    context_budget_tokens: int = 32000
     history_depth: int = 50
     cache_briefings_seconds: int = 60
     session_timeout_minutes: int = 30
