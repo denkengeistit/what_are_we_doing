@@ -69,7 +69,10 @@ def _parse_task_line(line: str, line_num: int) -> Task | None:
 
 
 class TaskStore:
-    """Parse and manipulate TASKS.md in Obsidian Tasks format."""
+    """Parse and manipulate TASKS.md in Obsidian Tasks format.
+    
+    Compatible with Obsidian Tasks plugin and Obsync for Apple Reminders sync.
+    """
     
     def __init__(self, workspace_path: str | Path):
         self._workspace = Path(workspace_path)
