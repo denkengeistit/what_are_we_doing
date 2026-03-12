@@ -52,6 +52,21 @@ class Oracle:
 
         # Build context and query oracle
         messages = await self._ctx.build_briefing_context(agent_name, task, focus)
+        
+        # Add task context if TASKS.md exists
+        from wawd.tasks import TaskStore
+        task_store = TaskStore(self._workspace)
+        assigned_tasks = task_store.get_tasks(assignee=agent_name)
+        if assigned_tasks:
+            task_lines = []
+            for t in assigned_tasks:
+                status_str = f"[{t.status}]" if t.status else ""
+                task_lines.append(f"  Line {t.line_num}: {t.text} {status_str}")
+            messages.append({
+                "role": "system",
+                "content": f"Tasks assigned to {agent_name}:\n" + "\n".join(task_lines),
+            })
+        
         response = await self._backend.generate(messages)
 
         return {

@@ -1,4 +1,4 @@
-"""MCP Server for WAWD. Exactly 3 tools."""
+"""MCP Server for WAWD: versioning + task management."""
 
 from __future__ import annotations
 
@@ -48,7 +48,7 @@ def _parse_since(since: str | None) -> float | None:
 
 
 def create_mcp_server(oracle: Oracle) -> Server:
-    """Create and configure the MCP server with exactly 3 tools."""
+    """Create and configure the MCP server."""
     server = Server("wawd")
 
     @server.list_tools()
@@ -134,6 +134,73 @@ def create_mcp_server(oracle: Oracle) -> Server:
                     "required": ["problem"],
                 },
             ),
+            Tool(
+                name="get_tasks",
+                description=(
+                    "List tasks from TASKS.md, filtered by assignee, status, or due date. "
+                    "Returns line numbers for claiming/completing."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "assignee": {
+                            "type": "string",
+                            "description": "Filter to tasks assigned to this agent.",
+                        },
+                        "status": {
+                            "type": "string",
+                            "description": "Filter by status (e.g. 'in-progress').",
+                        },
+                        "due_before": {
+                            "type": "string",
+                            "description": "Filter to tasks due before YYYY-MM-DD.",
+                        },
+                        "include_completed": {
+                            "type": "boolean",
+                            "description": "Include completed tasks.",
+                            "default": False,
+                        },
+                    },
+                },
+            ),
+            Tool(
+                name="claim_task",
+                description=(
+                    "Claim a task by line number: sets [assignee:: <your name>] and "
+                    "[status:: in-progress]. Use get_tasks to find available tasks first."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "line_num": {
+                            "type": "integer",
+                            "description": "Line number of the task in TASKS.md.",
+                        },
+                        "agent_name": {
+                            "type": "string",
+                            "description": "Your agent name/identifier.",
+                        },
+                    },
+                    "required": ["line_num", "agent_name"],
+                },
+            ),
+            Tool(
+                name="complete_task",
+                description=(
+                    "Mark a task as complete: checks the box and stamps ✅ YYYY-MM-DD. "
+                    "Obsync will sync this to Apple Reminders."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "line_num": {
+                            "type": "integer",
+                            "description": "Line number of the task in TASKS.md.",
+                        },
+                    },
+                    "required": ["line_num"],
+                },
+            ),
         ]
 
     @server.call_tool()
@@ -174,6 +241,39 @@ def create_mcp_server(oracle: Oracle) -> Server:
                         parts.append(f"  - {f['path']} -> v{f.get('to_version', '?')}")
                 parts.append(f"\n{result['explanation']}")
                 return [TextContent(type="text", text="\n".join(parts))]
+            
+            elif name == "get_tasks":
+                from wawd.tasks import TaskStore
+                task_store = TaskStore(oracle._workspace)
+                tasks = task_store.get_tasks(
+                    assignee=arguments.get("assignee"),
+                    status=arguments.get("status"),
+                    due_before=arguments.get("due_before"),
+                    include_completed=arguments.get("include_completed", False),
+                )
+                if not tasks:
+                    return [TextContent(type="text", text="No tasks found matching filters.")]
+                
+                lines = []
+                for task in tasks:
+                    line = f"Line {task.line_num}: {'[x]' if task.checked else '[ ]'} {task.text}"
+                    lines.append(line)
+                return [TextContent(type="text", text="\n".join(lines))]
+            
+            elif name == "claim_task":
+                from wawd.tasks import TaskStore
+                task_store = TaskStore(oracle._workspace)
+                task_store.claim_task(
+                    line_num=arguments["line_num"],
+                    agent_name=arguments["agent_name"],
+                )
+                return [TextContent(type="text", text=f"Task on line {arguments['line_num']} claimed by {arguments['agent_name']}.")]
+            
+            elif name == "complete_task":
+                from wawd.tasks import TaskStore
+                task_store = TaskStore(oracle._workspace)
+                task_store.complete_task(line_num=arguments["line_num"])
+                return [TextContent(type="text", text=f"Task on line {arguments['line_num']} marked complete.")]
 
             else:
                 return [TextContent(type="text", text=f"Unknown tool: {name}")]

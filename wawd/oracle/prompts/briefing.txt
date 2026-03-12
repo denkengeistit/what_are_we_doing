@@ -10,7 +10,8 @@ Generate a briefing that covers:
 1. ONE sentence overview of the project state.
 2. What changed recently (last few sessions): which files, by which agents, what the changes did. Be specific about file names and the nature of changes.
 3. Any active agents and what they're working on. Flag potential conflicts with the requesting agent's stated task.
-4. If the agent stated a task, give a 1-2 sentence suggestion for where to start.
+4. Tasks assigned to this agent (from TASKS.md). Mention these if present.
+5. If the agent stated a task, give a 1-2 sentence suggestion for where to start.
 
 Rules:
 - Be concise. Target 150-300 words.
