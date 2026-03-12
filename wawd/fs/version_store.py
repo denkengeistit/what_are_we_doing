@@ -256,6 +256,10 @@ class VersionStore:
         target = await self.get_version(version_id)
         if target is None:
             raise KeyError(f"Version not found: {version_id}")
+        if target.blob_hash is None:
+            raise ValueError(
+                f"Cannot restore to version {version_id}: it is a delete operation (no content)"
+            )
 
         content = await self._blobs.retrieve(target.blob_hash)
         ts = time.time()
