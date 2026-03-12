@@ -15,10 +15,9 @@ DEFAULT_CONFIG_PATH = DEFAULT_CONFIG_DIR / "config.yaml"
 
 
 class WorkspaceConfig(BaseModel):
-    """Source directory and FUSE mount point."""
+    """Source directory and watcher settings."""
 
     path: str
-    mount_point: str
     exclude: list[str] = [
         "node_modules/",
         ".git/",
@@ -26,6 +25,11 @@ class WorkspaceConfig(BaseModel):
         "*.pyc",
         "build/",
         "dist/",
+        ".DS_Store",
+        "*.swp",
+        "*~",
+        "*.tmp",
+        ".#*",
     ]
 
 
@@ -91,17 +95,13 @@ def load_config(path: Path | None = None) -> WAWDConfig:
     return WAWDConfig(**raw)
 
 
-def create_default_config(workspace_path: str, mount_point: str | None = None) -> Path:
+def create_default_config(workspace_path: str) -> Path:
     """Create a default config.yaml for a workspace and return its path."""
     DEFAULT_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-
-    if mount_point is None:
-        mount_point = str(Path(workspace_path).parent / (Path(workspace_path).name + ".wawd"))
 
     config = {
         "workspace": {
             "path": str(Path(workspace_path).resolve()),
-            "mount_point": str(Path(mount_point).resolve()),
         },
     }
 

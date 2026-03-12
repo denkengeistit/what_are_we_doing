@@ -5,7 +5,7 @@ description = "Shared versioned workspace with SLM oracle for multi-agent collab
 requires-python = ">=3.11"
 license = "MIT"
 dependencies = [
-    "mfusepy>=0.3.0",
+    "watchdog>=4.0.0",
     "mcp>=1.0.0",
     "aiosqlite>=0.20.0",
     "zstandard>=0.22.0",

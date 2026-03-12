@@ -10,5 +10,5 @@ class RestorationError(WAWDError):
     """Raised when a file restoration fails."""
 
 
-class FUSEError(WAWDError):
-    """Raised when a FUSE operation fails."""
+class WatcherError(WAWDError):
+    """Raised when a watcher operation fails."""

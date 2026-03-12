@@ -25,7 +25,7 @@ class Oracle:
         restorer: Restorer,
         backend: OracleBackend,
         workspace_path: str,
-        fuse_ops=None,
+        watcher=None,
     ) -> None:
         self._vs = version_store
         self._st = session_tracker
@@ -33,11 +33,11 @@ class Oracle:
         self._restorer = restorer
         self._backend = backend
         self._workspace = workspace_path
-        self._fuse = fuse_ops  # WAWDFuse instance, set after mount
+        self._watcher = watcher  # WAWDWatcher instance, set after start
 
-    def set_fuse(self, fuse_ops) -> None:
-        """Set the FUSE operations instance (for agent/session tracking on mount)."""
-        self._fuse = fuse_ops
+    def set_watcher(self, watcher) -> None:
+        """Set the watcher instance (for agent/session tracking)."""
+        self._watcher = watcher
 
     async def briefing(
         self,
@@ -49,10 +49,10 @@ class Oracle:
         # Register / update session
         session = await self._st.check_in(agent_name, task)
 
-        # Update FUSE layer with current agent info
-        if self._fuse is not None:
-            self._fuse.current_agent_id = agent_name
-            self._fuse.current_session_id = session.id
+        # Update watcher with current agent info
+        if self._watcher is not None:
+            self._watcher.current_agent_id = agent_name
+            self._watcher.current_session_id = session.id
 
         # Build context and query oracle
         messages = await self._ctx.build_briefing_context(agent_name, task, focus)

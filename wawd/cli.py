@@ -40,16 +40,12 @@ def main(ctx: click.Context, config_path: str | None, verbose: bool) -> None:
 
 @main.command()
 @click.argument("directory", type=click.Path(exists=True, file_okay=False))
-@click.option("--mount", "mount_point", default=None, help="Custom mount point.")
-def init(directory: str, mount_point: str | None) -> None:
+def init(directory: str) -> None:
     """Initialize a WAWD workspace for DIRECTORY."""
     directory = str(Path(directory).resolve())
 
-    config_path = create_default_config(directory, mount_point)
+    config_path = create_default_config(directory)
     config = load_config(config_path)
-
-    # Create mount point directory
-    Path(config.workspace.mount_point).mkdir(parents=True, exist_ok=True)
 
     # Initialize database
     async def _init_db():
@@ -75,7 +71,6 @@ def init(directory: str, mount_point: str | None) -> None:
     console.print(f"[green]✓[/green] Workspace initialized")
     console.print(f"  Config:  {config_path}")
     console.print(f"  Source:  {config.workspace.path}")
-    console.print(f"  Mount:   {config.workspace.mount_point}")
     console.print(f"  DB:      {config.db_path}")
     console.print()
     console.print("Next steps:")
@@ -86,7 +81,7 @@ def init(directory: str, mount_point: str | None) -> None:
 @main.command()
 @click.pass_context
 def start(ctx: click.Context) -> None:
-    """Start the WAWD daemon (FUSE mount + MCP server)."""
+    """Start the WAWD daemon (watcher + MCP server)."""
     config_path = ctx.obj.get("config_path")
     try:
         config = load_config(config_path)
@@ -104,7 +99,7 @@ async def _start_daemon(config: WAWDConfig) -> None:
 
     from wawd.fs.blob_store import BlobStore
     from wawd.fs.version_store import VersionStore
-    from wawd.fs.fuse_mount import mount_fuse, run_fuse_loop, stop_fuse
+    from wawd.fs.watcher import WAWDWatcher
     from wawd.oracle.backends.ollama import OllamaBackend
     from wawd.oracle.backends.llamacpp import LlamaCppBackend
     from wawd.oracle.context import ContextBuilder
@@ -117,6 +112,7 @@ async def _start_daemon(config: WAWDConfig) -> None:
     config.config_dir.mkdir(parents=True, exist_ok=True)
     db = await aiosqlite.connect(str(config.db_path))
 
+    watcher: WAWDWatcher | None = None
     try:
         # Initialize stores
         blob_store = BlobStore(db, config.versioning.compression_level)
@@ -158,38 +154,29 @@ async def _start_daemon(config: WAWDConfig) -> None:
             backend, config.workspace.path,
         )
 
-        # Mount FUSE
-        console.print(f"Mounting FUSE: {config.workspace.path} -> {config.workspace.mount_point}")
-        fuse_ops = await mount_fuse(
+        # Start watcher
+        console.print(f"Watching: {config.workspace.path}")
+        watcher = WAWDWatcher(
             config.workspace.path,
-            config.workspace.mount_point,
             version_store,
             config.workspace.exclude,
         )
-        oracle.set_fuse(fuse_ops)
-        restorer.set_fuse(fuse_ops, mount_path=config.workspace.mount_point)
+        await watcher.start()
+        oracle.set_watcher(watcher)
+        restorer.set_watcher(watcher)
 
         # Write PID file
         config.pid_path.write_text(str(os.getpid()))
 
         console.print(f"[green]✓[/green] WAWD started (PID {os.getpid()})")
-        console.print(f"  Work in: [bold]{config.workspace.mount_point}[/bold]")
+        console.print(f"  Work in: [bold]{config.workspace.path}[/bold]")
 
-        # Run FUSE loop and MCP server concurrently
-        fuse_task = asyncio.create_task(run_fuse_loop())
-        mcp_task = asyncio.create_task(run_stdio_server(oracle))
-
-        # Wait for either to finish (or Ctrl+C)
-        done, pending = await asyncio.wait(
-            [fuse_task, mcp_task],
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-
-        for task in pending:
-            task.cancel()
+        # Run MCP server (watcher runs in background via its drain loop)
+        await run_stdio_server(oracle)
 
     finally:
-        await stop_fuse()
+        if watcher:
+            await watcher.stop()
         await backend.close()
         await db.close()
         config.pid_path.unlink(missing_ok=True)
@@ -241,7 +228,6 @@ def status(ctx: click.Context) -> None:
 
     table.add_row("Status", "[green]Running[/green]" if running else "[red]Stopped[/red]")
     table.add_row("Source", config.workspace.path)
-    table.add_row("Mount", config.workspace.mount_point)
     table.add_row("Database", str(config.db_path))
     table.add_row("Backend", f"{config.oracle.backend} ({config.oracle.model})")
     table.add_row("Backend URL", config.oracle.base_url)

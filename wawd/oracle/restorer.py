@@ -59,17 +59,11 @@ class Restorer:
         self._ctx = context_builder
         self._backend = backend
         self._workspace = Path(workspace_path)
-        self._fuse = None  # WAWDFuse ops, set after mount via set_fuse()
+        self._watcher = None  # WAWDWatcher, set via set_watcher()
 
-    def set_fuse(self, fuse_ops, mount_path: str | None = None) -> None:
-        """Attach the FUSE ops instance for pause/resume during restoration.
-
-        If *mount_path* is provided, restoration disk-writes go through the
-        FUSE mount rather than directly to the source directory.  This is
-        required for FUSE-T (NFS-backed) to keep its client cache consistent.
-        """
-        self._fuse = fuse_ops
-        self._mount = Path(mount_path) if mount_path else None
+    def set_watcher(self, watcher) -> None:
+        """Attach the watcher instance for pause/resume during restoration."""
+        self._watcher = watcher
 
     async def analyze_and_restore(
         self,
@@ -109,9 +103,8 @@ class Restorer:
     async def execute_restoration_plan(self, plan: RestorationPlan) -> RestorationResult:
         """Execute a restoration plan: snapshot, restore, update disk.
 
-        The FUSE layer is paused during restoration so that disk writes
-        are not re-versioned, and any stale write buffers are invalidated
-        afterwards.
+        The watcher is paused during restoration so that disk writes
+        are not re-versioned.
         """
         if not plan.files:
             return RestorationResult(
@@ -131,9 +124,9 @@ class Restorer:
         except Exception as e:
             log.warning("Failed to create pre-restore snapshot: %s", e)
 
-        # Pause FUSE so restoration writes aren't re-versioned
-        if self._fuse:
-            self._fuse.pause()
+        # Pause watcher so restoration writes aren't re-versioned
+        if self._watcher:
+            self._watcher.pause()
 
         # Execute restorations
         restored = []
@@ -142,12 +135,8 @@ class Restorer:
                 try:
                     await self._vs.restore_file_to_version(fr.path, fr.to_version_id)
 
-                    # Update on-disk file.  If a mount path is
-                    # available, write through the mount so FUSE-T's
-                    # NFS client cache stays consistent.
                     content = await self._vs.get_content(fr.to_version_id)
-                    base = self._mount if self._mount else self._workspace
-                    disk_path = base / fr.path
+                    disk_path = self._workspace / fr.path
                     disk_path.parent.mkdir(parents=True, exist_ok=True)
                     disk_path.write_bytes(content)
 
@@ -165,9 +154,8 @@ class Restorer:
                         "error": str(e),
                     })
         finally:
-            if self._fuse:
-                self._fuse.invalidate([fr.path for fr in plan.files])
-                self._fuse.resume()
+            if self._watcher:
+                self._watcher.resume()
 
         return RestorationResult(
             action_taken="restored",
