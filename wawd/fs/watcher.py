@@ -1,8 +1,8 @@
 """Watchdog-based directory watcher for WAWD.
 
-Replaces the previous FUSE layer.  Uses OS-level file-system events
-(FSEvents on macOS, inotify on Linux) via the *watchdog* library to
-detect changes, debounces them, then hands batches to the version store.
+Uses OS-level filesystem events (FSEvents on macOS, inotify on Linux)
+via the *watchdog* library to detect changes, debounces them, then
+hands batches to the version store.
 """
 
 from __future__ import annotations
@@ -123,7 +123,7 @@ class WAWDWatcher:
         log.debug("Watcher resumed")
 
     def invalidate(self, paths: Sequence[str]) -> None:
-        """No-op for compatibility.  Nothing to invalidate without FUSE."""
+        """No-op kept for API compatibility with Restorer."""
         pass
 
     # ── internals ─────────────────────────────────────────────────

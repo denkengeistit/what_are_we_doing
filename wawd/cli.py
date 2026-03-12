@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import signal
+import subprocess
 import sys
 from pathlib import Path
 
@@ -102,6 +103,7 @@ async def _start_daemon(config: WAWDConfig) -> None:
     from wawd.fs.watcher import WAWDWatcher
     from wawd.oracle.backends.ollama import OllamaBackend
     from wawd.oracle.backends.llamacpp import LlamaCppBackend
+    from wawd.oracle.backends.openai_compat import OpenAICompatBackend
     from wawd.oracle.context import ContextBuilder
     from wawd.oracle.oracle import Oracle
     from wawd.oracle.restorer import Restorer
@@ -113,6 +115,7 @@ async def _start_daemon(config: WAWDConfig) -> None:
     db = await aiosqlite.connect(str(config.db_path))
 
     watcher: WAWDWatcher | None = None
+    ui_proc: subprocess.Popen | None = None
     try:
         # Initialize stores
         blob_store = BlobStore(db, config.versioning.compression_level)
@@ -126,6 +129,13 @@ async def _start_daemon(config: WAWDConfig) -> None:
         if config.oracle.backend == "llamacpp":
             backend = LlamaCppBackend(
                 base_url=config.oracle.base_url,
+                timeout=config.oracle.timeout_seconds,
+            )
+        elif config.oracle.backend == "openai_compat":
+            backend = OpenAICompatBackend(
+                base_url=config.oracle.base_url,
+                model=config.oracle.model,
+                api_key=config.oracle.api_key or None,
                 timeout=config.oracle.timeout_seconds,
             )
         else:
@@ -168,8 +178,19 @@ async def _start_daemon(config: WAWDConfig) -> None:
         # Write PID file
         config.pid_path.write_text(str(os.getpid()))
 
+        # Start Streamlit UI in background
+        ui_path = Path(__file__).parent / "ui.py"
+        ui_port = config.mcp.port or 8501
+        ui_proc = subprocess.Popen(
+            [sys.executable, "-m", "streamlit", "run", str(ui_path),
+             "--server.port", str(ui_port), "--server.headless", "true"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
         console.print(f"[green]✓[/green] WAWD started (PID {os.getpid()})")
         console.print(f"  Work in: [bold]{config.workspace.path}[/bold]")
+        console.print(f"  UI:      [bold]http://localhost:{ui_port}[/bold]")
 
         # Run MCP server (watcher runs in background via its drain loop)
         await run_stdio_server(oracle)
@@ -177,6 +198,10 @@ async def _start_daemon(config: WAWDConfig) -> None:
     finally:
         if watcher:
             await watcher.stop()
+        # Stop Streamlit UI
+        if ui_proc and ui_proc.poll() is None:
+            ui_proc.terminate()
+            ui_proc.wait(timeout=5)
         await backend.close()
         await db.close()
         config.pid_path.unlink(missing_ok=True)
@@ -286,6 +311,7 @@ async def _ask(config: WAWDConfig, question: str) -> None:
     from wawd.fs.version_store import VersionStore
     from wawd.oracle.backends.ollama import OllamaBackend
     from wawd.oracle.backends.llamacpp import LlamaCppBackend
+    from wawd.oracle.backends.openai_compat import OpenAICompatBackend
     from wawd.oracle.context import ContextBuilder
     from wawd.oracle.oracle import Oracle
     from wawd.oracle.restorer import Restorer
@@ -300,6 +326,13 @@ async def _ask(config: WAWDConfig, question: str) -> None:
         if config.oracle.backend == "llamacpp":
             backend = LlamaCppBackend(
                 base_url=config.oracle.base_url,
+                timeout=config.oracle.timeout_seconds,
+            )
+        elif config.oracle.backend == "openai_compat":
+            backend = OpenAICompatBackend(
+                base_url=config.oracle.base_url,
+                model=config.oracle.model,
+                api_key=config.oracle.api_key or None,
                 timeout=config.oracle.timeout_seconds,
             )
         else:
@@ -328,6 +361,20 @@ async def _ask(config: WAWDConfig, question: str) -> None:
         await backend.close()
     finally:
         await db.close()
+
+
+@main.command()
+@click.option("--port", default=8501, help="Port to run the UI on.")
+def ui(port: int) -> None:
+    """Launch the WAWD web UI (Streamlit)."""
+    import subprocess
+
+    ui_path = Path(__file__).parent / "ui.py"
+    console.print(f"[green]✓[/green] Starting WAWD UI on http://localhost:{port}")
+    subprocess.run(
+        [sys.executable, "-m", "streamlit", "run", str(ui_path),
+         "--server.port", str(port), "--server.headless", "true"],
+    )
 
 
 if __name__ == "__main__":

@@ -44,9 +44,10 @@ class VersioningConfig(BaseModel):
 class OracleConfig(BaseModel):
     """SLM backend settings (Ollama in Docker by default)."""
 
-    backend: str = "ollama"
+    backend: str = "ollama"  # ollama | llamacpp | openai_compat
     model: str = "qwen2.5:3b"
     base_url: str = "http://localhost:11434"
+    api_key: str = ""  # For openai_compat; overridden by WAWD_OPENAI_API_KEY env var
     timeout_seconds: float = 300.0
     context_budget_tokens: int = 32000
     history_depth: int = 50
@@ -96,17 +97,26 @@ def load_config(path: Path | None = None) -> WAWDConfig:
 
 
 def create_default_config(workspace_path: str) -> Path:
-    """Create a default config.yaml for a workspace and return its path."""
+    """Create or update config.yaml for a workspace and return its path.
+
+    If a config already exists, only the workspace path is updated;
+    all other settings (oracle, versioning, mcp) are preserved.
+    """
     DEFAULT_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
-    config = {
-        "workspace": {
-            "path": str(Path(workspace_path).resolve()),
-        },
-    }
+    # Load existing config if present
+    existing: dict = {}
+    if DEFAULT_CONFIG_PATH.exists():
+        with open(DEFAULT_CONFIG_PATH) as f:
+            existing = yaml.safe_load(f) or {}
+        log.info("Updating existing config at %s", DEFAULT_CONFIG_PATH)
+
+    # Update only the workspace path
+    existing.setdefault("workspace", {})
+    existing["workspace"]["path"] = str(Path(workspace_path).resolve())
 
     with open(DEFAULT_CONFIG_PATH, "w") as f:
-        yaml.dump(config, f, default_flow_style=False)
+        yaml.dump(existing, f, default_flow_style=False)
 
-    log.info("Created config at %s", DEFAULT_CONFIG_PATH)
+    log.info("Wrote config at %s", DEFAULT_CONFIG_PATH)
     return DEFAULT_CONFIG_PATH
