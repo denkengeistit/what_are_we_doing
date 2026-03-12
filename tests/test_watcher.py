@@ -159,19 +159,30 @@ async def test_resume_resumes_versioning(
 
 @pytest.mark.asyncio
 async def test_agent_attribution(
-    tmp_workspace: Path, mock_version_store: MagicMock, watcher: WAWDWatcher,
+    tmp_workspace: Path, mock_version_store: MagicMock,
 ):
-    """Agent/session IDs are forwarded to the version store."""
-    watcher.current_agent_id = "claude"
-    watcher.current_session_id = 42
+    """Agent/session IDs are resolved from SessionTracker at version-time."""
+    mock_tracker = MagicMock()
+    mock_session = MagicMock()
+    mock_session.agent_name = "claude"
+    mock_session.id = "session-42"
+    mock_tracker.get_active_sessions = AsyncMock(return_value=[mock_session])
+
+    w = WAWDWatcher(
+        str(tmp_workspace), mock_version_store,
+        exclude=[], session_tracker=mock_tracker,
+    )
+    await w.start()
 
     (tmp_workspace / "attr.txt").write_text("test")
     await asyncio.sleep(1.5)
 
+    await w.stop()
+
     for call in mock_version_store.record_version.call_args_list:
         if call.kwargs.get("path") == "attr.txt":
             assert call.kwargs["agent_id"] == "claude"
-            assert call.kwargs["session_id"] == 42
+            assert call.kwargs["session_id"] == "session-42"
             break
     else:
         pytest.fail("attr.txt not found in record_version calls")

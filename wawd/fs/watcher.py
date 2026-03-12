@@ -27,6 +27,11 @@ from wawd.fs.version_store import VersionStore
 
 log = logging.getLogger(__name__)
 
+# Avoid circular import — SessionTracker is only used for type hints
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from wawd.oracle.session_tracker import SessionTracker
+
 _DEBOUNCE_SECONDS = 0.5  # coalesce rapid-fire events
 
 
@@ -58,9 +63,9 @@ class _Handler(FileSystemEventHandler):
 class WAWDWatcher:
     """Watch *root* for changes, version them via *version_store*.
 
-    Public surface kept compatible with the old WAWDFuse so that Oracle /
-    Restorer can call ``pause()``, ``resume()``, ``invalidate()`` and set
-    ``current_agent_id`` / ``current_session_id`` without changes.
+    Attribution is resolved at version-time by querying the
+    SessionTracker for the most recently active session, so
+    concurrent agents are attributed correctly.
     """
 
     def __init__(
@@ -68,14 +73,12 @@ class WAWDWatcher:
         root: str | Path,
         version_store: VersionStore,
         exclude: Sequence[str] = (),
+        session_tracker: SessionTracker | None = None,
     ) -> None:
         self._root = Path(root).resolve()
         self._vs = version_store
         self._exclude = list(exclude)
-
-        # Agent / session attribution (set by Oracle.set_watcher)
-        self.current_agent_id: str | None = None
-        self.current_session_id: int | None = None
+        self._session_tracker = session_tracker
 
         # Internal state
         self._observer: Observer | None = None
@@ -172,12 +175,28 @@ class WAWDWatcher:
                 except Exception:
                     log.exception("Failed to version %s (%s)", rel, op)
 
+    async def _resolve_attribution(self) -> tuple[str | None, str | None]:
+        """Look up the most recently active session for attribution."""
+        if self._session_tracker is None:
+            return None, None
+        try:
+            sessions = await self._session_tracker.get_active_sessions()
+            if sessions:
+                # Most recently seen agent gets attribution
+                latest = sessions[0]  # already ordered by last_seen_at DESC
+                return latest.agent_name, latest.id
+        except Exception:
+            log.debug("Failed to resolve attribution", exc_info=True)
+        return None, None
+
     async def _version_one(self, rel: str, abs_path: str, op: str) -> None:
+        agent_id, session_id = await self._resolve_attribution()
+
         if op == "delete":
             await self._vs.record_delete(
                 path=rel,
-                agent_id=self.current_agent_id,
-                session_id=self.current_session_id,
+                agent_id=agent_id,
+                session_id=session_id,
             )
             return
 
@@ -191,8 +210,8 @@ class WAWDWatcher:
         await self._vs.record_version(
             path=rel,
             content=content,
-            agent_id=self.current_agent_id,
-            session_id=self.current_session_id,
+            agent_id=agent_id,
+            session_id=session_id,
         )
 
     async def _initial_scan(self) -> None:

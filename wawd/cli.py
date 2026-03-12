@@ -170,6 +170,7 @@ async def _start_daemon(config: WAWDConfig) -> None:
             config.workspace.path,
             version_store,
             config.workspace.exclude,
+            session_tracker=session_tracker,
         )
         await watcher.start()
         oracle.set_watcher(watcher)

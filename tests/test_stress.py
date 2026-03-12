@@ -767,11 +767,13 @@ async def test_oracle_briefing_returns_workspace_path(oracle, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_oracle_briefing_updates_watcher_attribution(oracle):
-    mock_watcher = MagicMock()
-    oracle.set_watcher(mock_watcher)
+async def test_oracle_briefing_registers_agent_session(oracle, session_tracker):
+    """Briefing registers the agent session so the watcher can resolve it."""
     await oracle.briefing("track-me", task="the task")
-    assert mock_watcher.current_agent_id == "track-me"
+    active = await session_tracker.get_active_sessions()
+    matched = [s for s in active if s.agent_name == "track-me"]
+    assert len(matched) == 1
+    assert matched[0].task == "the task"
 
 
 @pytest.mark.asyncio

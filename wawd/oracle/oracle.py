@@ -46,13 +46,9 @@ class Oracle:
         focus: str | None = None,
     ) -> dict:
         """Handle what_are_we_doing: register session + generate briefing."""
-        # Register / update session
+        # Register / update session — the watcher resolves attribution
+        # dynamically from the session tracker, so no global field update needed.
         session = await self._st.check_in(agent_name, task)
-
-        # Update watcher with current agent info
-        if self._watcher is not None:
-            self._watcher.current_agent_id = agent_name
-            self._watcher.current_session_id = session.id
 
         # Build context and query oracle
         messages = await self._ctx.build_briefing_context(agent_name, task, focus)
