@@ -133,10 +133,25 @@ class Restorer:
         try:
             for fr in plan.files:
                 try:
+                    # Snapshot current disk content before overwriting so the
+                    # pre-restore state is always recoverable, even if the
+                    # higher-level snapshot mechanism fails.
+                    disk_path = self._workspace / fr.path
+                    if disk_path.exists() and disk_path.is_file():
+                        try:
+                            current_content = disk_path.read_bytes()
+                            await self._vs.record_version(
+                                path=fr.path,
+                                content=current_content,
+                                agent_id="pre-restore-backup",
+                                intent=f"Auto-backup before restoring to v{fr.to_version_id}",
+                            )
+                        except Exception as e:
+                            log.warning("Failed to backup %s before restore: %s", fr.path, e)
+
                     await self._vs.restore_file_to_version(fr.path, fr.to_version_id)
 
                     content = await self._vs.get_content(fr.to_version_id)
-                    disk_path = self._workspace / fr.path
                     disk_path.parent.mkdir(parents=True, exist_ok=True)
                     disk_path.write_bytes(content)
 
