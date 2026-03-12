@@ -47,7 +47,7 @@ class OracleConfig(BaseModel):
     backend: str = "ollama"
     model: str = "qwen2.5:3b"
     base_url: str = "http://localhost:11434"
-    timeout_seconds: float = 30.0
+    timeout_seconds: float = 300.0
     context_budget_tokens: int = 32000
     history_depth: int = 50
     cache_briefings_seconds: int = 60
