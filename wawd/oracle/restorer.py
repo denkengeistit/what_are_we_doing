@@ -61,9 +61,15 @@ class Restorer:
         self._workspace = Path(workspace_path)
         self._fuse = None  # WAWDFuse ops, set after mount via set_fuse()
 
-    def set_fuse(self, fuse_ops) -> None:
-        """Attach the FUSE ops instance for pause/resume during restoration."""
+    def set_fuse(self, fuse_ops, mount_path: str | None = None) -> None:
+        """Attach the FUSE ops instance for pause/resume during restoration.
+
+        If *mount_path* is provided, restoration disk-writes go through the
+        FUSE mount rather than directly to the source directory.  This is
+        required for FUSE-T (NFS-backed) to keep its client cache consistent.
+        """
         self._fuse = fuse_ops
+        self._mount = Path(mount_path) if mount_path else None
 
     async def analyze_and_restore(
         self,
@@ -136,9 +142,12 @@ class Restorer:
                 try:
                     await self._vs.restore_file_to_version(fr.path, fr.to_version_id)
 
-                    # Update on-disk file
+                    # Update on-disk file.  If a mount path is
+                    # available, write through the mount so FUSE-T's
+                    # NFS client cache stays consistent.
                     content = await self._vs.get_content(fr.to_version_id)
-                    disk_path = self._workspace / fr.path
+                    base = self._mount if self._mount else self._workspace
+                    disk_path = base / fr.path
                     disk_path.parent.mkdir(parents=True, exist_ok=True)
                     disk_path.write_bytes(content)
 

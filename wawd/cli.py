@@ -167,7 +167,7 @@ async def _start_daemon(config: WAWDConfig) -> None:
             config.workspace.exclude,
         )
         oracle.set_fuse(fuse_ops)
-        restorer.set_fuse(fuse_ops)
+        restorer.set_fuse(fuse_ops, mount_path=config.workspace.mount_point)
 
         # Write PID file
         config.pid_path.write_text(str(os.getpid()))
