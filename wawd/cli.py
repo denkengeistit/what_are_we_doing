@@ -210,11 +210,19 @@ async def _start_daemon(config: WAWDConfig) -> None:
 
 
 @main.command()
-def stop() -> None:
-    """Stop the running WAWD daemon."""
-    pid_path = DEFAULT_CONFIG_DIR / "wawd.pid"
+@click.pass_context
+def stop(ctx: click.Context) -> None:
+    """Stop the running WAWD daemon for the current workspace."""
+    config_path = ctx.obj.get("config_path")
+    try:
+        config = load_config(config_path)
+    except FileNotFoundError:
+        console.print("[yellow]WAWD not initialized. Run wawd init first.[/yellow]")
+        return
+    
+    pid_path = config.pid_path
     if not pid_path.exists():
-        console.print("[yellow]No running WAWD instance found.[/yellow]")
+        console.print("[yellow]No running WAWD instance found for this workspace.[/yellow]")
         return
 
     pid = int(pid_path.read_text().strip())

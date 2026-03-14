@@ -74,11 +74,19 @@ class WAWDConfig(BaseModel):
 
     @property
     def db_path(self) -> Path:
-        return DEFAULT_CONFIG_DIR / "wawd.db"
+        """Return a unique DB path per workspace using slugified name + hash."""
+        import hashlib
+        slug = Path(self.workspace.path).name
+        ws_hash = hashlib.sha1(self.workspace.path.encode()).hexdigest()[:8]
+        return DEFAULT_CONFIG_DIR / f"wawd_{slug}_{ws_hash}.db"
 
     @property
     def pid_path(self) -> Path:
-        return DEFAULT_CONFIG_DIR / "wawd.pid"
+        """Return a unique PID path per workspace."""
+        import hashlib
+        slug = Path(self.workspace.path).name
+        ws_hash = hashlib.sha1(self.workspace.path.encode()).hexdigest()[:8]
+        return DEFAULT_CONFIG_DIR / f"wawd_{slug}_{ws_hash}.pid"
 
 
 def load_config(path: Path | None = None) -> WAWDConfig:
